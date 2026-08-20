@@ -21,6 +21,7 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use futures::future::join_all;
 use serde_json::Value as JsonValue;
 use tokio::sync::OnceCell;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::CodeModeConfig;
@@ -72,6 +73,7 @@ pub(crate) struct CodeModeService {
     availability: Result<(), String>,
     dispatch_broker: Arc<CodeModeDispatchBroker>,
     default_exec_yield_time_ms: u64,
+    cell_admission: Semaphore,
     shutdown_token: CancellationToken,
     unavailable_warning_emitted: AtomicBool,
 }
@@ -90,6 +92,7 @@ impl CodeModeService {
             availability,
             dispatch_broker,
             default_exec_yield_time_ms: config.default_exec_yield_time_ms,
+            cell_admission: Semaphore::new(1),
             shutdown_token: CancellationToken::new(),
             unavailable_warning_emitted: AtomicBool::new(false),
         }
@@ -122,11 +125,22 @@ impl CodeModeService {
     pub(crate) async fn execute(
         &self,
         mut request: codex_code_mode::ExecuteRequest,
+        cancellation_token: &CancellationToken,
     ) -> Result<codex_code_mode::StartedCell, String> {
         request
             .yield_time_ms
             .get_or_insert(self.default_exec_yield_time_ms);
-        self.session().await?.execute(request).await
+        let _admission = self
+            .cell_admission
+            .acquire()
+            .await
+            .map_err(|_| "code mode cell admission is unavailable".to_string())?;
+        if cancellation_token.is_cancelled() {
+            return Err("code mode execution cancelled".to_string());
+        }
+        let started_cell = self.session().await?.execute(request).await?;
+        self.dispatch_broker.track_cell(&started_cell.cell_id);
+        Ok(started_cell)
     }
 
     pub(crate) async fn wait(
@@ -144,18 +158,35 @@ impl CodeModeService {
     }
 
     pub(crate) async fn interrupt_active_cells(&self) {
-        let Some(session) = self.session.get() else {
-            return;
+        let (session, active_cell_ids) = {
+            let Ok(_admission) = self.cell_admission.acquire().await else {
+                return;
+            };
+            let Some(session) = self.session.get() else {
+                return;
+            };
+            (Arc::clone(session), self.dispatch_broker.active_cell_ids())
         };
         join_all(
-            self.dispatch_broker
-                .active_cell_ids()
-                .into_iter()
-                .map(|cell_id| async move {
-                    if let Err(error) = session.terminate(cell_id.clone()).await {
-                        tracing::warn!(%cell_id, %error, "failed to terminate interrupted code-mode cell");
+            active_cell_ids.into_iter().map(|cell_id| {
+                let session = Arc::clone(&session);
+                async move {
+                    match session.terminate(cell_id.clone()).await {
+                        Ok(codex_code_mode::WaitOutcome::LiveCell(
+                            RuntimeResponse::Terminated { .. } | RuntimeResponse::Result { .. },
+                        ))
+                        | Ok(codex_code_mode::WaitOutcome::MissingCell(_)) => {
+                            self.dispatch_broker.close_cell(&cell_id);
+                        }
+                        Ok(codex_code_mode::WaitOutcome::LiveCell(
+                            RuntimeResponse::Yielded { .. },
+                        )) => {}
+                        Err(error) => {
+                            tracing::warn!(%cell_id, %error, "failed to terminate interrupted code-mode cell");
+                        }
                     }
-                }),
+                }
+            }),
         )
         .await;
     }
