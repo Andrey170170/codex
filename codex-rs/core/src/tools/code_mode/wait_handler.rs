@@ -73,6 +73,7 @@ impl CodeModeWaitHandler {
             call_id,
             tool_name,
             payload,
+            cancellation_token,
             ..
         } = invocation;
 
@@ -99,14 +100,14 @@ impl CodeModeWaitHandler {
                     exec.session
                         .services
                         .code_mode_service
-                        .terminate(cell_id)
+                        .terminate(cell_id.clone())
                         .await
                 } else {
                     exec.session
                         .services
                         .code_mode_service
                         .wait(codex_code_mode::WaitRequest {
-                            cell_id,
+                            cell_id: cell_id.clone(),
                             yield_time_ms: args.yield_time_ms,
                         })
                         .await
@@ -115,44 +116,56 @@ impl CodeModeWaitHandler {
                     telemetry.finish(/*success*/ false);
                     FunctionCallError::RespondToModel(error)
                 })?;
-                if let codex_code_mode::WaitOutcome::LiveCell(response) = &wait_response {
-                    let runtime_cell_id = match response {
-                        codex_code_mode::RuntimeResponse::Yielded { cell_id, .. }
-                        | codex_code_mode::RuntimeResponse::Terminated { cell_id, .. }
-                        | codex_code_mode::RuntimeResponse::Result { cell_id, .. } => cell_id,
-                    };
-                    telemetry.cell_id = Some(runtime_cell_id.to_string());
-                    if let Some(executed_tool_calls) =
-                        exec.session.services.executed_tool_calls.as_ref()
-                    {
-                        executed_tool_calls.register_cell(runtime_cell_id, &call_id);
+                match &wait_response {
+                    codex_code_mode::WaitOutcome::LiveCell(response) => {
+                        let runtime_cell_id = match response {
+                            codex_code_mode::RuntimeResponse::Yielded { cell_id, .. }
+                            | codex_code_mode::RuntimeResponse::Terminated { cell_id, .. }
+                            | codex_code_mode::RuntimeResponse::Result { cell_id, .. } => cell_id,
+                        };
+                        telemetry.cell_id = Some(runtime_cell_id.to_string());
+                        if let Some(executed_tool_calls) =
+                            exec.session.services.executed_tool_calls.as_ref()
+                        {
+                            executed_tool_calls.register_cell(runtime_cell_id, &call_id);
+                        }
+                        if !matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. }) {
+                            exec.session
+                                .services
+                                .rollout_thread_trace
+                                .code_cell_trace_context(
+                                    exec.turn.sub_id.as_str(),
+                                    runtime_cell_id.as_str(),
+                                )
+                                .record_ended(response);
+                            exec.session
+                                .services
+                                .code_mode_service
+                                .finish_cell_dispatch(runtime_cell_id);
+                            exec.session
+                                .services
+                                .analytics_events_client
+                                .track_code_mode_tool_call(
+                                    codex_analytics::CodeModeToolCallFact::CellClosed {
+                                        thread_id: exec.session.thread_id.to_string(),
+                                        turn_id: exec.turn.sub_id.clone(),
+                                        cell_id: runtime_cell_id.to_string(),
+                                    },
+                                );
+                        }
                     }
-                    if !matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. }) {
-                        exec.session
-                            .services
-                            .rollout_thread_trace
-                            .code_cell_trace_context(
-                                exec.turn.sub_id.as_str(),
-                                runtime_cell_id.as_str(),
-                            )
-                            .record_ended(response);
+                    codex_code_mode::WaitOutcome::MissingCell(_) => {
                         exec.session
                             .services
                             .code_mode_service
-                            .finish_cell_dispatch(runtime_cell_id);
-                        exec.session
-                            .services
-                            .analytics_events_client
-                            .track_code_mode_tool_call(
-                                codex_analytics::CodeModeToolCallFact::CellClosed {
-                                    thread_id: exec.session.thread_id.to_string(),
-                                    turn_id: exec.turn.sub_id.clone(),
-                                    cell_id: runtime_cell_id.to_string(),
-                                },
-                            );
+                            .finish_cell_dispatch(&cell_id);
                     }
                 }
-                exec.session.services.elicitations.wait_until_clear().await;
+                exec.session
+                    .services
+                    .elicitations
+                    .wait_until_clear_or_cancelled(&cancellation_token)
+                    .await;
                 handle_runtime_response(&exec, wait_response.into(), args.max_tokens, started_at)
                     .await
                     .map_err(FunctionCallError::RespondToModel)

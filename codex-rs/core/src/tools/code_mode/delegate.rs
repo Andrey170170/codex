@@ -58,12 +58,9 @@ impl CodeModeDispatchBroker {
                 .dispatch_gates
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let gate = dispatch_gates
-                .entry(cell_id.clone())
-                .or_insert_with(|| CellDispatchGate {
-                    ready: watch::channel(false).0,
-                    originating_item_id: None,
-                });
+            let Some(gate) = dispatch_gates.get_mut(cell_id) else {
+                return;
+            };
             gate.originating_item_id = originating_item_id;
             gate.ready.clone()
         };
@@ -76,6 +73,10 @@ impl CodeModeDispatchBroker {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(cell_id)
             .and_then(|gate| gate.originating_item_id.clone())
+    }
+
+    pub(super) fn track_cell(&self, cell_id: &CellId) {
+        drop(dispatch_gate(&self.dispatch_gates, cell_id));
     }
 
     pub(super) fn close_cell(&self, cell_id: &CellId) {

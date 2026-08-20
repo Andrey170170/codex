@@ -32,16 +32,15 @@ impl CodeModeExecuteHandler {
 
     async fn execute(
         &self,
-        session: std::sync::Arc<crate::session::session::Session>,
-        turn: std::sync::Arc<crate::session::turn_context::TurnContext>,
+        exec: ExecContext,
         call_id: String,
         originating_item_id: Option<codex_protocol::ResponseItemId>,
         code: String,
+        cancellation_token: &tokio_util::sync::CancellationToken,
         telemetry: &mut CodeModeToolCallGuard,
     ) -> Result<FunctionToolOutput, FunctionCallError> {
         let args =
             codex_code_mode::parse_exec_source(&code).map_err(FunctionCallError::RespondToModel)?;
-        let exec = ExecContext { session, turn };
         let mut enabled_tools = Vec::with_capacity(self.nested_tool_specs.len());
         for (spec, cached_runtime) in &self.nested_tool_specs {
             if let Some(cached_definitions) = cached_runtime
@@ -67,13 +66,16 @@ impl CodeModeExecuteHandler {
             .session
             .services
             .code_mode_service
-            .execute(codex_code_mode::ExecuteRequest {
-                tool_call_id: call_id.clone(),
-                enabled_tools,
-                source: args.code.clone(),
-                yield_time_ms: args.yield_time_ms,
-                max_output_tokens: args.max_output_tokens,
-            })
+            .execute(
+                codex_code_mode::ExecuteRequest {
+                    tool_call_id: call_id.clone(),
+                    enabled_tools,
+                    source: args.code.clone(),
+                    yield_time_ms: args.yield_time_ms,
+                    max_output_tokens: args.max_output_tokens,
+                },
+                cancellation_token,
+            )
             .await
             .map_err(FunctionCallError::RespondToModel)?;
         let cell_id = started_cell.cell_id.clone();
@@ -130,7 +132,11 @@ impl CodeModeExecuteHandler {
                     cell_id: cell_id.to_string(),
                 });
         }
-        exec.session.services.elicitations.wait_until_clear().await;
+        exec.session
+            .services
+            .elicitations
+            .wait_until_clear_or_cancelled(cancellation_token)
+            .await;
         handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
             .await
             .map_err(FunctionCallError::RespondToModel)
@@ -166,6 +172,7 @@ impl CodeModeExecuteHandler {
             call_id,
             tool_name,
             payload,
+            cancellation_token,
             ..
         } = invocation;
 
@@ -177,14 +184,15 @@ impl CodeModeExecuteHandler {
             call_id.clone(),
             PUBLIC_TOOL_NAME,
         );
+        let exec = ExecContext { session, turn };
         let result = match payload {
             ToolPayload::Custom { input } if is_exec_tool_name(&tool_name) => self
                 .execute(
-                    session,
-                    turn,
+                    exec,
                     call_id,
                     originating_item_id,
                     input,
+                    &cancellation_token,
                     &mut telemetry,
                 )
                 .await

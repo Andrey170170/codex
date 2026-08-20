@@ -1,7 +1,11 @@
 use std::fs;
+use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::task::Poll;
 
 use codex_protocol::protocol::SessionSource;
 use codex_rollout_trace::ExecutionStatus;
@@ -9,6 +13,7 @@ use codex_rollout_trace::ThreadStartedTraceMetadata;
 use codex_rollout_trace::ToolCallRequester;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
+use tokio::sync::Barrier;
 use tokio_util::sync::CancellationToken;
 
 use crate::function_tool::FunctionCallError;
@@ -63,27 +68,70 @@ impl ToolExecutor<ToolInvocation> for TestHandler {
 
 impl CoreToolRuntime for TestHandler {}
 
-struct MissingCellCodeModeSessionProvider;
+#[derive(Clone, Copy, Debug)]
+enum TestTerminateOutcome {
+    Missing,
+    Terminated,
+    Result,
+}
 
-impl codex_code_mode::CodeModeSessionProvider for MissingCellCodeModeSessionProvider {
+struct TestCodeModeSessionProvider {
+    session: Arc<TestCodeModeSession>,
+}
+
+impl codex_code_mode::CodeModeSessionProvider for TestCodeModeSessionProvider {
     fn create_session<'a>(
         &'a self,
         _delegate: Arc<dyn codex_code_mode::CodeModeSessionDelegate>,
     ) -> codex_code_mode::CodeModeSessionProviderFuture<'a> {
-        Box::pin(async {
-            Ok(Arc::new(MissingCellCodeModeSession) as Arc<dyn codex_code_mode::CodeModeSession>)
-        })
+        let session = Arc::clone(&self.session);
+        Box::pin(async move { Ok(session as Arc<dyn codex_code_mode::CodeModeSession>) })
     }
 }
 
-struct MissingCellCodeModeSession;
+struct TestCodeModeSession {
+    terminate_outcome: TestTerminateOutcome,
+    cell_id: codex_code_mode::CellId,
+    execute_barrier: Option<Arc<Barrier>>,
+    execute_count: AtomicUsize,
+    terminate_count: AtomicUsize,
+}
 
-impl codex_code_mode::CodeModeSession for MissingCellCodeModeSession {
+impl TestCodeModeSession {
+    fn new(terminate_outcome: TestTerminateOutcome, cell_id: codex_code_mode::CellId) -> Self {
+        Self {
+            terminate_outcome,
+            cell_id,
+            execute_barrier: None,
+            execute_count: AtomicUsize::new(0),
+            terminate_count: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl codex_code_mode::CodeModeSession for TestCodeModeSession {
     fn execute<'a>(
         &'a self,
         _request: codex_code_mode::ExecuteRequest,
     ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::StartedCell> {
-        Box::pin(async { Err("test session cannot execute cells".to_string()) })
+        self.execute_count.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            if let Some(execute_barrier) = &self.execute_barrier {
+                execute_barrier.wait().await;
+                execute_barrier.wait().await;
+            }
+            let cell_id = self.cell_id.clone();
+            let response_cell_id = cell_id.clone();
+            Ok(codex_code_mode::StartedCell::from_future(
+                cell_id,
+                async move {
+                    Ok(codex_code_mode::RuntimeResponse::Yielded {
+                        cell_id: response_cell_id,
+                        content_items: Vec::new(),
+                    })
+                },
+            ))
+        })
     }
 
     fn wait<'a>(
@@ -97,14 +145,31 @@ impl codex_code_mode::CodeModeSession for MissingCellCodeModeSession {
         &'a self,
         cell_id: codex_code_mode::CellId,
     ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::WaitOutcome> {
+        self.terminate_count.fetch_add(1, Ordering::Relaxed);
+        let terminate_outcome = self.terminate_outcome;
         Box::pin(async move {
-            Ok(codex_code_mode::WaitOutcome::MissingCell(
-                codex_code_mode::RuntimeResponse::Result {
-                    error_text: Some(format!("exec cell {cell_id} not found")),
+            let response = match terminate_outcome {
+                TestTerminateOutcome::Missing | TestTerminateOutcome::Result => {
+                    codex_code_mode::RuntimeResponse::Result {
+                        error_text: (matches!(terminate_outcome, TestTerminateOutcome::Missing))
+                            .then(|| format!("exec cell {cell_id} not found")),
+                        cell_id,
+                        content_items: Vec::new(),
+                    }
+                }
+                TestTerminateOutcome::Terminated => codex_code_mode::RuntimeResponse::Terminated {
                     cell_id,
                     content_items: Vec::new(),
                 },
-            ))
+            };
+            Ok(match terminate_outcome {
+                TestTerminateOutcome::Missing => {
+                    codex_code_mode::WaitOutcome::MissingCell(response)
+                }
+                TestTerminateOutcome::Terminated | TestTerminateOutcome::Result => {
+                    codex_code_mode::WaitOutcome::LiveCell(response)
+                }
+            })
         })
     }
 
@@ -280,10 +345,25 @@ async fn dispatch_lifecycle_trace_records_incompatible_payload_failures() -> any
 async fn missing_code_mode_wait_traces_only_the_wait_tool_call() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let (mut session, turn) = make_session_and_context().await;
+    let missing_cell_id = codex_code_mode::CellId::new("noop".to_string());
+    let code_mode_session = Arc::new(TestCodeModeSession::new(
+        TestTerminateOutcome::Missing,
+        missing_cell_id,
+    ));
     session.services.code_mode_service = CodeModeService::new(
-        Arc::new(MissingCellCodeModeSessionProvider),
+        Arc::new(TestCodeModeSessionProvider {
+            session: Arc::clone(&code_mode_session),
+        }),
         &turn.config.code_mode,
         session.services.executed_tool_calls.clone(),
+    );
+    drop(
+        session
+            .services
+            .code_mode_service
+            .execute(test_execute_request(), &CancellationToken::new())
+            .await
+            .map_err(anyhow::Error::msg)?,
     );
     attach_test_trace(&mut session, &turn, temp.path())?;
 
@@ -292,7 +372,7 @@ async fn missing_code_mode_wait_traces_only_the_wait_tool_call() -> anyhow::Resu
     let turn = Arc::new(turn);
 
     let mut invocation = test_invocation(
-        session,
+        Arc::clone(&session),
         turn,
         "wait-call",
         WAIT_TOOL_NAME,
@@ -311,6 +391,17 @@ async fn missing_code_mode_wait_traces_only_the_wait_tool_call() -> anyhow::Resu
         .dispatch_any_with_terminal_outcome(invocation, /*terminal_outcome_reached*/ None)
         .await?;
 
+    session
+        .services
+        .code_mode_service
+        .interrupt_active_cells()
+        .await;
+    assert_eq!(
+        code_mode_session.terminate_count.load(Ordering::Relaxed),
+        1,
+        "a missing cell must not be terminated again after its dispatch gate closes"
+    );
+
     let replayed = codex_rollout_trace::replay_bundle(single_bundle_dir(temp.path())?)?;
     assert_eq!(replayed.code_cells.len(), 0);
     assert!(
@@ -320,6 +411,146 @@ async fn missing_code_mode_wait_traces_only_the_wait_tool_call() -> anyhow::Resu
     );
 
     Ok(())
+}
+
+#[tokio::test]
+async fn interrupted_code_mode_cells_clear_terminal_dispatch_gates() -> anyhow::Result<()> {
+    let (_, turn) = make_session_and_context().await;
+
+    for terminate_outcome in [
+        TestTerminateOutcome::Missing,
+        TestTerminateOutcome::Terminated,
+        TestTerminateOutcome::Result,
+    ] {
+        let cell_id = codex_code_mode::CellId::new(format!("{terminate_outcome:?}"));
+        let code_mode_session =
+            Arc::new(TestCodeModeSession::new(terminate_outcome, cell_id.clone()));
+        let service = CodeModeService::new(
+            Arc::new(TestCodeModeSessionProvider {
+                session: Arc::clone(&code_mode_session),
+            }),
+            &turn.config.code_mode,
+            /*executed_tool_calls*/ None,
+        );
+        drop(
+            service
+                .execute(test_execute_request(), &CancellationToken::new())
+                .await
+                .map_err(anyhow::Error::msg)?,
+        );
+
+        service.interrupt_active_cells().await;
+        service.mark_cell_ready_for_dispatch(&cell_id, /*originating_item_id*/ None);
+        service.interrupt_active_cells().await;
+
+        assert_eq!(
+            code_mode_session.terminate_count.load(Ordering::Relaxed),
+            1,
+            "{terminate_outcome:?} must close its dispatch gate",
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn interrupt_waits_for_runtime_cell_admission_before_snapshotting_active_cells()
+-> anyhow::Result<()> {
+    let (_, turn) = make_session_and_context().await;
+    let execute_barrier = Arc::new(Barrier::new(2));
+    let cell_id = codex_code_mode::CellId::new("created-before-admission".to_string());
+    let code_mode_session = Arc::new(TestCodeModeSession {
+        terminate_outcome: TestTerminateOutcome::Terminated,
+        cell_id,
+        execute_barrier: Some(Arc::clone(&execute_barrier)),
+        execute_count: AtomicUsize::new(0),
+        terminate_count: AtomicUsize::new(0),
+    });
+    let service = Arc::new(CodeModeService::new(
+        Arc::new(TestCodeModeSessionProvider {
+            session: Arc::clone(&code_mode_session),
+        }),
+        &turn.config.code_mode,
+        /*executed_tool_calls*/ None,
+    ));
+    let execute_service = Arc::clone(&service);
+    let execute_task = tokio::spawn(async move {
+        execute_service
+            .execute(test_execute_request(), &CancellationToken::new())
+            .await
+            .map(drop)
+            .map_err(anyhow::Error::msg)
+    });
+    execute_barrier.wait().await;
+
+    let interrupt = service.interrupt_active_cells();
+    tokio::pin!(interrupt);
+    let interrupt_completed_before_admission =
+        std::future::poll_fn(|context| Poll::Ready(interrupt.as_mut().poll(context).is_ready()))
+            .await;
+    execute_barrier.wait().await;
+    if !interrupt_completed_before_admission {
+        interrupt.await;
+    }
+    execute_task.await??;
+
+    assert!(
+        !interrupt_completed_before_admission,
+        "interrupt must wait until a created runtime cell is admitted"
+    );
+    assert_eq!(
+        code_mode_session.terminate_count.load(Ordering::Relaxed),
+        1,
+        "interrupt must terminate the cell admitted by the in-flight execution"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_runtime_cell_admission_does_not_start_a_cell() -> anyhow::Result<()> {
+    let (_, turn) = make_session_and_context().await;
+    let cell_id = codex_code_mode::CellId::new("cancelled-before-admission".to_string());
+    let code_mode_session = Arc::new(TestCodeModeSession::new(
+        TestTerminateOutcome::Terminated,
+        cell_id,
+    ));
+    let service = CodeModeService::new(
+        Arc::new(TestCodeModeSessionProvider {
+            session: Arc::clone(&code_mode_session),
+        }),
+        &turn.config.code_mode,
+        /*executed_tool_calls*/ None,
+    );
+    let cancellation_token = CancellationToken::new();
+    cancellation_token.cancel();
+
+    service.interrupt_active_cells().await;
+    let execution = service
+        .execute(test_execute_request(), &cancellation_token)
+        .await;
+
+    assert_eq!(
+        execution.err().as_deref(),
+        Some("code mode execution cancelled")
+    );
+    assert_eq!(
+        code_mode_session.execute_count.load(Ordering::Relaxed),
+        0,
+        "an interrupt completed before admission must prevent runtime execution"
+    );
+
+    Ok(())
+}
+
+fn test_execute_request() -> codex_code_mode::ExecuteRequest {
+    codex_code_mode::ExecuteRequest {
+        tool_call_id: "test-call".to_string(),
+        enabled_tools: Vec::new(),
+        source: "await new Promise(() => {});".to_string(),
+        yield_time_ms: Some(1),
+        max_output_tokens: None,
+    }
 }
 
 fn test_invocation(
