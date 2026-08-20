@@ -151,8 +151,19 @@ impl CodeModeService {
                 .active_cell_ids()
                 .into_iter()
                 .map(|cell_id| async move {
-                    if let Err(error) = session.terminate(cell_id.clone()).await {
-                        tracing::warn!(%cell_id, %error, "failed to terminate interrupted code-mode cell");
+                    match session.terminate(cell_id.clone()).await {
+                        Ok(codex_code_mode::WaitOutcome::LiveCell(
+                            RuntimeResponse::Terminated { .. } | RuntimeResponse::Result { .. },
+                        ))
+                        | Ok(codex_code_mode::WaitOutcome::MissingCell(_)) => {
+                            self.dispatch_broker.close_cell(&cell_id);
+                        }
+                        Ok(codex_code_mode::WaitOutcome::LiveCell(
+                            RuntimeResponse::Yielded { .. },
+                        )) => {}
+                        Err(error) => {
+                            tracing::warn!(%cell_id, %error, "failed to terminate interrupted code-mode cell");
+                        }
                     }
                 }),
         )
@@ -182,6 +193,11 @@ impl CodeModeService {
 
     pub(crate) fn finish_cell_dispatch(&self, cell_id: &CellId) {
         self.dispatch_broker.close_cell(cell_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_cell_dispatch_for_test(&self, cell_id: &CellId) -> bool {
+        self.dispatch_broker.has_dispatch_gate(cell_id)
     }
 
     pub(crate) fn start_turn_worker(

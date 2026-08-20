@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 /// Coordinates user elicitations that pause tool-result delivery for a session.
 ///
@@ -70,6 +71,16 @@ impl ElicitationService {
     pub(crate) async fn wait_until_clear(&self) {
         let mut paused = self.subscribe();
         let _ = paused.wait_for(|paused| !*paused).await;
+    }
+
+    pub(crate) async fn wait_until_clear_or_cancelled(
+        &self,
+        cancellation_token: &CancellationToken,
+    ) {
+        tokio::select! {
+            _ = self.wait_until_clear() => {}
+            _ = cancellation_token.cancelled() => {}
+        }
     }
 
     fn decrement(&self) {

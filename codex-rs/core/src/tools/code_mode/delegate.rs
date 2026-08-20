@@ -54,6 +54,14 @@ impl CodeModeDispatchBroker {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(super) fn has_dispatch_gate(&self, cell_id: &CellId) -> bool {
+        self.dispatch_gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(cell_id)
+    }
+
     pub(super) fn start_turn_worker(
         &self,
         exec: ExecContext,

@@ -60,22 +60,35 @@ impl ToolExecutor<ToolInvocation> for TestHandler {
 
 impl CoreToolRuntime for TestHandler {}
 
-struct MissingCellCodeModeSessionProvider;
+#[derive(Clone, Copy, Debug)]
+enum TestTerminateOutcome {
+    Missing,
+    Terminated,
+    Result,
+}
 
-impl codex_code_mode::CodeModeSessionProvider for MissingCellCodeModeSessionProvider {
+struct TestCodeModeSessionProvider {
+    terminate_outcome: TestTerminateOutcome,
+}
+
+impl codex_code_mode::CodeModeSessionProvider for TestCodeModeSessionProvider {
     fn create_session<'a>(
         &'a self,
         _delegate: Arc<dyn codex_code_mode::CodeModeSessionDelegate>,
     ) -> codex_code_mode::CodeModeSessionProviderFuture<'a> {
-        Box::pin(async {
-            Ok(Arc::new(MissingCellCodeModeSession) as Arc<dyn codex_code_mode::CodeModeSession>)
+        let terminate_outcome = self.terminate_outcome;
+        Box::pin(async move {
+            Ok(Arc::new(TestCodeModeSession { terminate_outcome })
+                as Arc<dyn codex_code_mode::CodeModeSession>)
         })
     }
 }
 
-struct MissingCellCodeModeSession;
+struct TestCodeModeSession {
+    terminate_outcome: TestTerminateOutcome,
+}
 
-impl codex_code_mode::CodeModeSession for MissingCellCodeModeSession {
+impl codex_code_mode::CodeModeSession for TestCodeModeSession {
     fn execute<'a>(
         &'a self,
         _request: codex_code_mode::ExecuteRequest,
@@ -94,14 +107,30 @@ impl codex_code_mode::CodeModeSession for MissingCellCodeModeSession {
         &'a self,
         cell_id: codex_code_mode::CellId,
     ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::WaitOutcome> {
+        let terminate_outcome = self.terminate_outcome;
         Box::pin(async move {
-            Ok(codex_code_mode::WaitOutcome::MissingCell(
-                codex_code_mode::RuntimeResponse::Result {
-                    error_text: Some(format!("exec cell {cell_id} not found")),
+            let response = match terminate_outcome {
+                TestTerminateOutcome::Missing | TestTerminateOutcome::Result => {
+                    codex_code_mode::RuntimeResponse::Result {
+                        error_text: (matches!(terminate_outcome, TestTerminateOutcome::Missing))
+                            .then(|| format!("exec cell {cell_id} not found")),
+                        cell_id,
+                        content_items: Vec::new(),
+                    }
+                }
+                TestTerminateOutcome::Terminated => codex_code_mode::RuntimeResponse::Terminated {
                     cell_id,
                     content_items: Vec::new(),
                 },
-            ))
+            };
+            Ok(match terminate_outcome {
+                TestTerminateOutcome::Missing => {
+                    codex_code_mode::WaitOutcome::MissingCell(response)
+                }
+                TestTerminateOutcome::Terminated | TestTerminateOutcome::Result => {
+                    codex_code_mode::WaitOutcome::LiveCell(response)
+                }
+            })
         })
     }
 
@@ -278,7 +307,9 @@ async fn missing_code_mode_wait_traces_only_the_wait_tool_call() -> anyhow::Resu
     let temp = TempDir::new()?;
     let (mut session, turn) = make_session_and_context().await;
     session.services.code_mode_service = CodeModeService::new(
-        Arc::new(MissingCellCodeModeSessionProvider),
+        Arc::new(TestCodeModeSessionProvider {
+            terminate_outcome: TestTerminateOutcome::Missing,
+        }),
         &turn.config.code_mode,
     );
     attach_test_trace(&mut session, &turn, temp.path())?;
@@ -286,9 +317,20 @@ async fn missing_code_mode_wait_traces_only_the_wait_tool_call() -> anyhow::Resu
     let registry = ToolRegistry::with_handler_for_test(Arc::new(CodeModeWaitHandler));
     let session = Arc::new(session);
     let turn = Arc::new(turn);
+    let missing_cell_id = codex_code_mode::CellId::new("noop".to_string());
+    session
+        .services
+        .code_mode_service
+        .mark_cell_ready_for_dispatch(&missing_cell_id);
+    assert!(
+        session
+            .services
+            .code_mode_service
+            .has_cell_dispatch_for_test(&missing_cell_id)
+    );
 
     let mut invocation = test_invocation(
-        session,
+        Arc::clone(&session),
         turn,
         "wait-call",
         WAIT_TOOL_NAME,
@@ -307,6 +349,14 @@ async fn missing_code_mode_wait_traces_only_the_wait_tool_call() -> anyhow::Resu
         .dispatch_any_with_terminal_outcome(invocation, /*terminal_outcome_reached*/ None)
         .await?;
 
+    assert!(
+        !session
+            .services
+            .code_mode_service
+            .has_cell_dispatch_for_test(&missing_cell_id),
+        "a missing cell must not retain a dispatch gate"
+    );
+
     let replayed = codex_rollout_trace::replay_bundle(single_bundle_dir(temp.path())?)?;
     assert_eq!(replayed.code_cells.len(), 0);
     assert!(
@@ -314,6 +364,41 @@ async fn missing_code_mode_wait_traces_only_the_wait_tool_call() -> anyhow::Resu
             .raw_result_payload_id
             .is_some()
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn interrupted_code_mode_cells_clear_terminal_dispatch_gates() -> anyhow::Result<()> {
+    let (_, turn) = make_session_and_context().await;
+
+    for terminate_outcome in [
+        TestTerminateOutcome::Missing,
+        TestTerminateOutcome::Terminated,
+        TestTerminateOutcome::Result,
+    ] {
+        let service = CodeModeService::new(
+            Arc::new(TestCodeModeSessionProvider { terminate_outcome }),
+            &turn.config.code_mode,
+        );
+        let cell_id = codex_code_mode::CellId::new(format!("{terminate_outcome:?}"));
+        service
+            .wait(codex_code_mode::WaitRequest {
+                cell_id: cell_id.clone(),
+                yield_time_ms: 1,
+            })
+            .await
+            .map_err(anyhow::Error::msg)?;
+        service.mark_cell_ready_for_dispatch(&cell_id);
+        assert!(service.has_cell_dispatch_for_test(&cell_id));
+
+        service.interrupt_active_cells().await;
+
+        assert!(
+            !service.has_cell_dispatch_for_test(&cell_id),
+            "{terminate_outcome:?} must not retain a dispatch gate"
+        );
+    }
 
     Ok(())
 }
