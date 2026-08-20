@@ -36,6 +36,7 @@ impl CodeModeExecuteHandler {
         turn: std::sync::Arc<crate::session::turn_context::TurnContext>,
         call_id: String,
         code: String,
+        cancellation_token: &tokio_util::sync::CancellationToken,
         telemetry: &mut CodeModeToolCallGuard,
     ) -> Result<FunctionToolOutput, FunctionCallError> {
         let args =
@@ -129,7 +130,11 @@ impl CodeModeExecuteHandler {
                     cell_id: cell_id.to_string(),
                 });
         }
-        exec.session.services.elicitations.wait_until_clear().await;
+        exec.session
+            .services
+            .elicitations
+            .wait_until_clear_or_cancelled(cancellation_token)
+            .await;
         handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
             .await
             .map_err(FunctionCallError::RespondToModel)
@@ -161,6 +166,7 @@ impl CodeModeExecuteHandler {
             call_id,
             tool_name,
             payload,
+            cancellation_token,
             ..
         } = invocation;
 
@@ -173,7 +179,14 @@ impl CodeModeExecuteHandler {
         );
         let result = match payload {
             ToolPayload::Custom { input } if is_exec_tool_name(&tool_name) => self
-                .execute(session, turn, call_id, input, &mut telemetry)
+                .execute(
+                    session,
+                    turn,
+                    call_id,
+                    input,
+                    &cancellation_token,
+                    &mut telemetry,
+                )
                 .await
                 .map(boxed_tool_output),
             _ => Err(FunctionCallError::RespondToModel(format!(
